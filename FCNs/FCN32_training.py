@@ -1,16 +1,17 @@
+
 import tensorflow as tf
-from tensorflow.contrib.data import Dataset, Iterator
+# from tensorflow.contrib.data import Dataset, Iterator
 import numpy as np
 from dataProcessing import *
 import math
 import GPUtil
 
-batchSize = 1
+batchSize = 10
 img_height = 224
 img_width = 224
 num_channels = 3
 patchSize = 5
-learningRate = 0.001
+learningRate = 0.0001
 weight_decay = 1e-4
 num_classes = 21
 n_epochs = 100
@@ -20,11 +21,27 @@ model_path = 'model'
 VGG_MEAN = [103.939, 116.779, 123.68]
 data_dict = np.load('../../vgg19.npy', encoding='latin1').item()
 
+print(data_dict.keys())
 print(len(data_dict['fc8']))
+
+def random_crop(image, label):
+    random_crop_with_mask = lambda image, label: tf.unstack(
+        tf.random_crop(tf.concat((image, label), axis=-1), self._crop_shape), axis=-1)
+    channel_list = random_crop_with_mask(image, label)
+    image = tf.transpose(channel_list[:-1], [1,2,0])
+    label = tf.expand_dims(channel_list[-1], axis=-1)
+    return image, label
+
+def random_flip(image, label):
+    im_la = tf.unstack(tf.image.random_flip_left_right(tf.concat((image, label), axis=-1)), num=24,axis=-1)
+    image = tf.transpose(im_la[:3], [1,2,0])
+    label = tf.transpose(im_la[3:], [1,2,0])
+    return (image, label)
+
 
 def conv_layer(bottom, inchannels, outchannels, name):
     # print(name)
-    with tf.variable_scope(name) as scope:
+    with tf.variable_scope(name):
         filt, conv_biases = get_var(name)
         
         conv = tf.nn.conv2d(bottom,filt,[1,1,1,1],padding='SAME')
@@ -34,7 +51,7 @@ def conv_layer(bottom, inchannels, outchannels, name):
         return relu
 
 def fc_layer(bottom, inchannels, outchannels, name):
-    with tf.variable_scope(name) as scope:
+    with tf.variable_scope(name):
         weight, conv_biases = get_var(name)
 
         if name == 'fc6':
@@ -68,9 +85,9 @@ def get_var(name):
 
 def get_variable_with_decay(shape,stddev, name):
     weights = tf.Variable(tf.truncated_normal(shape=shape, stddev = stddev), name=name)
-    weights_with_decay = tf.multiply(tf.nn.l2_loss(weights), weight_decay)
-    # print(weights)
-    tf.add_to_collection(tf.GraphKeys.REGULARIZATION_LOSSES, weights_with_decay)
+    # weights_with_decay = tf.multiply(tf.nn.l2_loss(weights), weight_decay)
+    # # print(weights)
+    # tf.add_to_collection(tf.GraphKeys.REGULARIZATION_LOSSES, weights_with_decay)
 
     return weights
 
@@ -78,7 +95,7 @@ def get_bias_variable(shape,name, constant=0.0):
     return tf.Variable(tf.constant(constant,shape=shape),name=name)
 
 def score_layer(bottom, num_classes, name):
-    with tf.variable_scope(name) as scope:
+    with tf.variable_scope(name) :
     	# print(bottom)
         infeatures = bottom.get_shape()[3].value
         shape = [1,1,infeatures,num_classes]
@@ -115,7 +132,7 @@ def get_deconv_filter(shape):
 
 def upscore_layer(bottom, name, shape, num_classes,ksize, stride):
     strides = [1, stride, stride, 1]
-    with tf.variable_scope(name) as scope:
+    with tf.variable_scope(name):
         infeatures = bottom.get_shape()[3].value
         weight_shape = [ksize,ksize,num_classes,infeatures]
 
@@ -129,6 +146,7 @@ def upscore_layer(bottom, name, shape, num_classes,ksize, stride):
 def model(img):
 
     # Convert RGB to BGR
+    tf.summary.image('train_images',img)
     red, green, blue = tf.split(axis=3, num_or_size_splits=3, value=img)
         
     bgr = tf.concat(axis=3, values=[
@@ -174,85 +192,62 @@ def model(img):
 
     pred = tf.argmax(upscore,axis=3)
 
-    return pred, tf.nn.softmax(upscore)
+    tf.summary.image('grayScale_prediction',tf.cast(tf.expand_dims(tf.multiply(pred,tf.constant(10, dtype=tf.int64)),3),tf.float16))
+
+    return pred, upscore
 
 
-# train_data = tf.py_func(createDataset,tf.float32)
+
 
 graph = tf.Graph()
 with graph.as_default():
-    x = tf.placeholder(tf.float32,shape=[None,img_height,img_width,num_channels])
-    y = tf.placeholder(tf.float32,shape=[None,img_height,img_width, None])
+    dataset = createDataset()
+    m = lambda x: tf.py_func(convert_from_color_segmentation, [x], tf.float32)
+    readImages = lambda x: tf.py_func(crop_image, [x], tf.float32)
+    dataset = dataset.map(lambda x, y: (readImages(x), m(readImages(y))))
+    dataset = dataset.map(lambda x, y: random_flip(x,y))
+    dataset = dataset.shuffle(buffer_size= 10)
+    dataset = dataset.batch(batchSize)
+    iterator = dataset.make_initializable_iterator()
+    images, labels = iterator.get_next()
 
-    pred, logits = model(x)
-    # print(logits.dtype)
+    # pred, logits = model(images)
+    # # print(logits.dtype)
 
-    loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=logits,labels=y))
-
-    optimizer = tf.train.AdamOptimizer(learningRate).minimize(loss)
+    # loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=logits,labels=labels))
+    # # tf.summary.scalar('step_loss',loss)
+    # summary = tf.summary.merge_all()
+    # optimizer = tf.train.AdamOptimizer(learningRate).minimize(loss)
 
 with tf.Session(graph=graph) as sess:
-    saver = tf.train.Saver(max_to_keep=50)
+    # saver = tf.train.Saver(max_to_keep=50)
 
     
     tf.global_variables_initializer().run()
 
-    # features_placeholder = tf.placeholder(train_data[0].dtype, train_data[0].shape)
-    # labels_placeholder = tf.placeholder(train_data[1].dtype, train_data[1].shape)
-    # dataset = Dataset.from_tensor_slices((features_placeholder, labels_placeholder))
+    writer = tf.summary.FileWriter("output", sess.graph)
     
-    dataset = createDataset()
-    dataset = dataset.shuffle(buffer_size= 50)
-    dataset = dataset.batch(batchSize)
-    # train_data = train_data.batch(batchSize)
-    # create TensorFlow Iterator object
-    # iterator = Iterator.from_structure(train_data.output_types,
-    #                                train_data.output_shapes)
-    iterator = dataset.make_initializable_iterator()
-    next_element = iterator.get_next()
-
-    # create two initialization ops to switch between the datasets
-    # training_init_op = iterator.make_initializer(dataset)
-    # validation_init_op = iterator.make_initializer(val_data)
-
-    # sess.run(training_init_op)
-
-
     for epoch in range(n_epochs):
         
         sess.run(iterator.initializer)
 
         print(GPUtil.showUtilization())
+        step=0
         while True:
             try:
-                train_img, labels = sess.run(next_element)
-                # train_img, labels = map(tf.py_func(input_parser, 
-                #         [train_img, labels], [tf.float32, tf.float32]), [train_img, labels])
-
-                train_images = map(crop_image,train_img)
-                # train_images = np.array(train_images,dtype=np.float32)
-                train_labels = map(crop_image,labels)
-                train_labels = map(convert_from_color_segmentation, train_labels)
-                # train_labels = np.array(train_labels,dtype=np.float32)
-
-
-                steploss, _ = sess.run([loss,optimizer], feed_dict= {
-                        x: train_images,
-                        y: train_labels
-                    })
+                step+=1
+                imagesss,labelsss = sess.run([images,labels])
+                print(imagesss.shape)
+                print(labelsss.shape)
+                # writer.add_summary(steploss,epoch*step)
+                # writer.add_summary(summary_)
+                # print(steploss)
             except tf.errors.OutOfRangeError:
                 print("End of training dataset.")
                 break
-            print(steploss)
+    writer.close()
+        # steploss, _ = sess.run([loss])
+        
 
-        print ("Epoch ", epoch, " is done. Saving the model ... ")
-        saver.save(sess, os.path.join(model_path, 'model'), global_step=epoch)
-
-
-
-
-
-
-
-
-
+        # print ("Epoch ", epoch, " is done. Saving the model ... ")
+        # saver.save(sess, os.path.join(model_path, 'model'), global_step=epoch)
