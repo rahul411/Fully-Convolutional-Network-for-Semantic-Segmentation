@@ -1,2 +1,4 @@
-# Fully-Convolutional-Network-for-Semantic-Segmentation
-This is an implementation of a paper on Fully convolutional network for semantic segmentation by Jonathan Long et.al
+# Semantic Image Segmentation
+This repository has an implementation for FCNs and PSPNet. 
+For PSPNet, using the pre-trained ResNet-101, provided by Tensorflow models library. 
+Also, code for training the models on multiple gpus is incorporated. 
