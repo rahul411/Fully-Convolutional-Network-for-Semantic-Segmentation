@@ -7,14 +7,14 @@ import math
 from utils import *
 from dataProcessing import read_and_crop_images, random_flip, createDataset, crop_image, convert_from_color_segmentation, resnet_features, input_parser
 
-layerName = 'resnet_v1_101/block3'
+layerName = 'resnet_v1_101/block4'
 num_classes = 21
 batchSize = 1
 img_height = 512
 img_width = 512
 feature_map_height = img_height//8
 feature_map_width = img_width//8 
-filter_depth = 1024
+filter_depth = 2048
 weight_decay = 0.0001
 momentum = 0.9
 learningRate = 0.0001
@@ -53,7 +53,7 @@ def get_slice(data, idx, parts):
     return tf.slice(data, start, size)
 
 
-def conv_layer(bottom, inchannels, outchannels, name):
+def conv_layer(bottom, inchannels, outchannels, name, relu=True, batch_norm=True):
     # print(name)
     with tf.variable_scope(name) as scope:
 
@@ -62,10 +62,13 @@ def conv_layer(bottom, inchannels, outchannels, name):
         
         conv = tf.nn.conv2d(bottom,filt,[1,1,1,1],padding='SAME')
         bias = tf.nn.bias_add(conv, conv_biases)
-        layer = tf.layers.batch_normalization(bias)
-        relu = tf.nn.relu(layer)
+        if batch_norm:
+            layer = tf.layers.batch_normalization(bias)
+        if relu:
+            relu_layer = tf.nn.relu(layer)
+            return relu_layer
 
-        return relu
+        return bias
 
 def get_variable_with_decay(shape, name):
     initializer = tf.contrib.layers.xavier_initializer()
@@ -112,15 +115,18 @@ def upscore_layer(bottom, name, shape, num_classes,ksize, stride, inchannels = 2
         return deconv
 
 def spatialPooling(bottom, pooling_dims):
-	shape = bottom.get_shape()
-	pool_layers = {}
-	for i in pooling_dims:
-		pool = tf.nn.max_pool(bottom,[1,math.ceil(feature_map_width/i), math.ceil(feature_map_height/i),1],
-								[1, math.floor(feature_map_width/i + 1), math.floor(feature_map_height/i + 1),1],padding='SAME',name='spatialpool'+ str(i))
+    shape = bottom.get_shape()
+    pool_layers = {}
+    for i in pooling_dims:
+        pool = tf.nn.max_pool(bottom,[1,math.ceil(feature_map_width/i), math.ceil(feature_map_height/i),1],
+                                [1, math.floor(feature_map_width/i + 1), math.floor(feature_map_height/i + 1),1],padding='SAME',name='spatialpool'+ str(i))
 
-		pool_layers[str(i)] = pool
+        pool_layers[str(i)] = pool
 
-	return pool_layers
+    return pool_layers
+
+def resize_layer(bottom, size):
+    return tf.image.resize_bilinear(bottom, size=size)
 
 def model(features):
 
@@ -128,38 +134,28 @@ def model(features):
     features_shape = tf.shape(features)
     pool_layers = spatialPooling(features,[1,2,3,6])
 
-    sp_conv_6 = conv_layer(pool_layers['6'], filter_depth, filter_depth//4, 'sp_conv_6')
+    sp_conv_6 = conv_layer(pool_layers['6'], filter_depth, 512, 'sp_conv_6')
 
-    sp_conv_3 = conv_layer(pool_layers['3'], filter_depth, filter_depth//4, 'sp_conv_3')
+    sp_conv_3 = conv_layer(pool_layers['3'], filter_depth, 512, 'sp_conv_3')
 
-    sp_conv_2 = conv_layer(pool_layers['2'], filter_depth, filter_depth//4, 'sp_conv_2')
+    sp_conv_2 = conv_layer(pool_layers['2'], filter_depth, 512, 'sp_conv_2')
 
-    sp_conv_1 = conv_layer(pool_layers['1'], filter_depth, filter_depth//4, 'sp_conv_1')
+    sp_conv_1 = conv_layer(pool_layers['1'], filter_depth, 512, 'sp_conv_1')
 
-    upscore_layer_6 = upscore_layer(sp_conv_6, name='upscore_layer_6', shape=features_shape,
-                                        num_classes=filter_depth//4, ksize=22,stride=11)
-
-    upscore_layer_3 = upscore_layer(sp_conv_3, name='upscore_layer_3', shape=features_shape,
-                                        num_classes=filter_depth//4, ksize=44,stride=22)
-
-    upscore_layer_2 = upscore_layer(sp_conv_2, name='upscore_layer_2', shape=features_shape,
-                                        num_classes=filter_depth//4, ksize=64,stride=32)
-
-    upscore_layer_1 = upscore_layer(sp_conv_1, name='upscore_layer_1', shape=features_shape,
-                                        num_classes=filter_depth//4, ksize=128,stride=64)
+    upscore_layer_6 = resize_layer(sp_conv_6, features_shape[1:3])
+    upscore_layer_3 = resize_layer(sp_conv_3, features_shape[1:3])
+    upscore_layer_2 = resize_layer(sp_conv_2, features_shape[1:3])
+    upscore_layer_1 = resize_layer(sp_conv_1, features_shape[1:3])
 
 
-    final_layer = tf.concat([upscore_layer_1, upscore_layer_2, upscore_layer_3, upscore_layer_6, features],axis=3)
+    concat_layer_1 = tf.concat([upscore_layer_1, upscore_layer_2, upscore_layer_3, upscore_layer_6, features],axis=3)
 
-        # print(final_layer.get_shape().as_list())
-    upscore_layer_final = upscore_layer(final_layer, name='upscore_layer_final', 
-                                        shape=[features_shape[0], tf.constant(img_width),tf.constant(img_height),features_shape[3]],
-                                        num_classes=num_classes, ksize=64,stride=32, inchannels=2048)
-
-    pred = tf.argmax(upscore_layer_final,axis=3)
+    concat_layer_2 = conv_layer(concat_layer_1, 4096, 512, 'concat_layer_2')
+    final_layer = conv_layer(concat_layer_2, 512, num_classes, 'final_layer', batch_norm = False, relu = False)
+    pred = tf.argmax(final_layer,axis=3)
     # tf.summary.image('grayScale_prediction',tf.cast(tf.expand_dims(tf.multiply(pred,tf.constant(10, dtype=tf.int64)),3),tf.float16))
 
-    return pred, upscore_layer_final
+    return pred, final_layer
 
 
 
@@ -175,7 +171,7 @@ with graph.as_default():
     train_dataset = createDataset('train')
     train_dataset = train_dataset.map(lambda x, y: (tf.image.random_brightness(read_and_crop_images(x,'jpeg'), delta), m(y)))
     # train_dataset = train_dataset.map(lambda x, y: random_flip(x,y))
-    train_dataset = train_dataset.map(lambda x, y: (resnet_features(x, layerName),tf.image.resize_image_with_crop_or_pad(y,img_width,img_height)))
+    train_dataset = train_dataset.map(lambda x, y: (resnet_features(x, layerName),tf.image.resize_image_with_crop_or_pad(y,img_height//8,img_width//8)))
     train_dataset = train_dataset.shuffle(buffer_size= 2)
     train_dataset = train_dataset.batch(batchSize)
 
