@@ -17,24 +17,101 @@ network_name = 'resnet_v1_101'
 checkpoint = '../../resnet_v1_101/resnet_v1_101.ckpt'
 layer_names = ['resnet_v1_101/block1']
 NUM_CLASSES = 21
-imgs_directory = '../../VOCdevkit/VOC2012/JPEGImages/'
+cityscape_directory = '../../../cityscape_dataset/'
+imgs_directory = '../../../VOCdevkit/VOC2012/JPEGImages/'
 imgs_aug_directory = '../../../benchmark_RELEASE/dataset/img/'
 labels_directory = '../../../benchmark_RELEASE/dataset/cls/'
-segmentation_directory = '../../VOCdevkit/VOC2012/SegmentationClass/'
+segmentation_directory = '../../../VOCdevkit/VOC2012/SegmentationClass/'
 VGG_MEAN = [103.939, 116.779, 123.68]
 slim = tf.contrib.slim
+
+label_colours = [(128, 64, 128), (244, 35, 231), (69, 69, 69)
+                # 0 = road, 1 = sidewalk, 2 = building
+                ,(102, 102, 156), (190, 153, 153), (153, 153, 153)
+                # 3 = wall, 4 = fence, 5 = pole
+                ,(250, 170, 29), (219, 219, 0), (106, 142, 35)
+                # 6 = traffic light, 7 = traffic sign, 8 = vegetation
+                ,(152, 250, 152), (69, 129, 180), (219, 19, 60)
+                # 9 = terrain, 10 = sky, 11 = person
+                ,(255, 0, 0), (0, 0, 142), (0, 0, 69)
+                # 12 = rider, 13 = car, 14 = truck
+                ,(0, 60, 100), (0, 79, 100), (0, 0, 230)
+                # 15 = bus, 16 = train, 17 = motocycle
+                ,(119, 10, 32)]
+                # 18 = bicycle
+
+def decode_labels(mask, img_shape, num_classes):
+    color_table = label_colours
+
+    color_mat = tf.constant(color_table, dtype=tf.float32)
+    onehot_output = tf.one_hot(mask, depth=num_classes)
+    onehot_output = tf.reshape(onehot_output, (-1, num_classes))
+    pred = tf.matmul(onehot_output, color_mat)
+    pred = tf.reshape(pred, (img_shape[0], img_shape[1], img_shape[2], 3))
+    
+    return pred
+
+def prepare_label(input_batch, new_size, num_classes, one_hot=True):
+    with tf.name_scope('label_encode'):
+        input_batch = tf.image.resize_nearest_neighbor(input_batch, new_size) # as labels are integer numbers, need to use NN interp.
+        input_batch = tf.squeeze(input_batch, squeeze_dims=[3]) # reducing the channel dimension.
+        if one_hot:
+            input_batch = tf.one_hot(input_batch, depth=num_classes)
+            
+    return input_batch
 
 def load_labels(path):
     label = sio.loadmat(path)
     return np.expand_dims(label['GTcls']['Segmentation'][0][0].astype(np.float32),axis=2)
 
-def random_crop(self, image, label):
+def random_crop(image, label):
     random_crop_with_mask = lambda image, label: tf.unstack(
-        tf.random_crop(tf.concat((image, label), axis=-1), self._crop_shape), axis=-1)
+        tf.random_crop(tf.concat((image, label), axis=-1), _crop_shape), axis=-1)
     channel_list = random_crop_with_mask(image, label)
     image = tf.transpose(channel_list[:-1], [1,2,0])
     label = tf.expand_dims(channel_list[-1], axis=-1)
     return image, label
+
+def random_crop_and_pad_image_and_labels(image, label, crop_h, crop_w, ignore_label=255):
+    label = tf.cast(label, dtype=tf.float32)
+    image = tf.cast(image, dtype=tf.float32)
+    label = label - ignore_label # Needs to be subtracted and later added due to 0 padding.
+    combined = tf.concat(axis=2, values=[image, label])
+    image_shape = tf.shape(image)
+    combined_pad = tf.image.pad_to_bounding_box(combined, 0, 0, tf.maximum(crop_h, image_shape[0]), tf.maximum(crop_w, image_shape[1]))
+
+    last_image_dim = tf.shape(image)[-1]
+    last_label_dim = tf.shape(label)[-1]
+    combined_crop = tf.random_crop(combined_pad, [crop_h,crop_w,4])
+    img_crop = combined_crop[:, :, :last_image_dim]
+    label_crop = combined_crop[:, :, last_image_dim:]
+    label_crop = label_crop + ignore_label
+    label_crop = tf.cast(label_crop, dtype=tf.uint8)
+
+    # Set static shape so that tensorflow knows shape at compile time.
+    img_crop.set_shape((crop_h, crop_w, 3))
+    label_crop.set_shape((crop_h,crop_w, 1))
+    return img_crop, label_crop
+
+def image_mirroring(img, label):
+    distort_left_right_random = tf.random_uniform([1], 0, 1.0, dtype=tf.float32)[0]
+    mirror = tf.less(tf.stack([1.0, distort_left_right_random, 1.0]), 0.5)
+    mirror = tf.boolean_mask([0, 1, 2], mirror)
+    img = tf.reverse(img, mirror)
+    label = tf.reverse(label, mirror)
+    
+    return img, label
+
+def image_scaling(img, label):
+    scale = tf.random_uniform([1], minval=0.5, maxval=2.0, dtype=tf.float32, seed=None)
+    h_new = tf.to_int32(tf.multiply(tf.to_float(tf.shape(img)[0]), scale))
+    w_new = tf.to_int32(tf.multiply(tf.to_float(tf.shape(img)[1]), scale))
+    new_shape = tf.squeeze(tf.stack([h_new, w_new]), squeeze_dims=[1])
+    img = tf.image.resize_images(img, new_shape)
+    label = tf.image.resize_nearest_neighbor(tf.expand_dims(label, 0), new_shape)
+    label = tf.squeeze(label, squeeze_dims=[0])
+
+    return img, label
 
 def random_flip(image, label):
     im_la = tf.unstack(tf.image.random_flip_left_right(tf.concat((image, label), axis=-1)),num=24, axis=-1)
@@ -60,6 +137,15 @@ def read_and_crop_images(filename, filetype, target_width=224,target_height=224)
     image = tf.image.resize_image_with_crop_or_pad(image_decoded,target_width,target_height)
 
     return image
+
+def read_images(filename, filetype, channels=1):
+    image_string = tf.read_file(filename)
+    if filetype == 'jpeg':
+      image_decoded = tf.image.decode_jpeg(image_string, channels=channels)
+    else:
+      image_decoded = tf.image.decode_image(image_string, channels=channels)
+
+    return image_decoded
 
 def input_parser(label_path):
     
@@ -122,7 +208,27 @@ def convert_from_color_segmentation(arr_3d):
     return np.array(arr_2d)
 ####################################################################################################################
 
-  
+def pascal_palette_for_cityscape():
+    ignore_label = 255
+    id_to_trainid = {-1: ignore_label, 0: ignore_label, 1: ignore_label, 2: ignore_label,
+                              3: ignore_label, 4: ignore_label, 5: ignore_label, 6: ignore_label,
+                              7: 0, 8: 1, 9: ignore_label, 10: ignore_label, 11: 2, 12: 3, 13: 4,
+                              14: ignore_label, 15: ignore_label, 16: ignore_label, 17: 5,
+                              18: ignore_label, 19: 6, 20: 7, 21: 8, 22: 9, 23: 10, 24: 11, 25: 12, 26: 13, 27: 14,
+                              28: 15, 29: ignore_label, 30: ignore_label, 31: 16, 32: 17, 33: 18}
+    return id_to_trainid
+
+def convert_to_train_ids(arr_3d):
+    arr_3d = np.squeeze(arr_3d)
+    #print(arr_3d.shape)
+    arr_2d = np.zeros((arr_3d.shape[0], arr_3d.shape[1]), dtype=np.uint8)
+    palette = pascal_palette_for_cityscape()
+    for c, i in palette.items():
+        m = np.where(arr_3d == c)
+        arr_2d[m] = i
+    return np.expand_dims(arr_2d,axis=2)
+
+#For VOC
 def createDataset_for_augmentedData(data_type='train'):
     
     train_imgs = []
@@ -146,8 +252,46 @@ def createDataset_for_augmentedData(data_type='train'):
         print('done preparing training data')
         return train_data
     else:
-        val_images = list(map(lambda img_path: imgs_aug_directory + img_path + '.jpg', val_imgs[:10]))
-        val_labels = list(map(lambda img_path: labels_directory + img_path + '.mat', val_imgs[:10]))
+        val_images = list(map(lambda img_path: imgs_aug_directory + img_path + '.jpg', val_imgs))
+        val_labels = list(map(lambda img_path: labels_directory + img_path + '.mat', val_imgs))
+        val_data = tf.data.Dataset.from_tensor_slices((val_images,val_labels))
+
+        print('done preparing validation data')
+        return val_data
+
+#For cityscape
+def createDataset_for_cityscape(data_type='train'):
+    
+    train_imgs = []
+    val_imgs = []
+    train_labels = []
+    val_labels = []
+    with open('cityscapes_train_list.txt','r') as file:
+        
+        for line in file:
+            img, label = line.replace('\n','').split(' ')
+            train_imgs.append(img)
+            train_labels.append(label)
+        print(len(train_imgs))
+
+    with open('cityscapes_val_list.txt','r') as file:
+        
+        for line in file:
+            img, label =  line.replace('\n','').split(' ')
+            val_imgs.append(img)
+            val_labels.append(label)
+        print(len(val_imgs))
+
+    if data_type == 'train':
+        train_images = list(map(lambda img_path: cityscape_directory + img_path , train_imgs))
+        train_labels = list(map(lambda img_path: cityscape_directory + img_path , train_labels))
+        train_data = tf.data.Dataset.from_tensor_slices((train_images,train_labels))
+
+        print('done preparing training data')
+        return train_data
+    else:
+        val_images = list(map(lambda img_path: cityscape_directory + img_path , val_imgs))
+        val_labels = list(map(lambda img_path: cityscape_directory + img_path , val_labels))
         val_data = tf.data.Dataset.from_tensor_slices((val_images,val_labels))
 
         print('done preparing validation data')
@@ -157,13 +301,13 @@ def createDataset(data_type='train'):
     
     train_imgs = []
     val_imgs = []
-    with open('../../VOCdevkit/VOC2012/ImageSets/Segmentation/train.txt','r') as file:
+    with open('../../../VOCdevkit/VOC2012/ImageSets/Segmentation/train.txt','r') as file:
         
         for line in file:
             train_imgs.append(line.replace('\n',''))
         print(len(train_imgs))
 
-    with open('../../VOCdevkit/VOC2012/ImageSets/Segmentation/val.txt','r') as file:
+    with open('../../../VOCdevkit/VOC2012/ImageSets/Segmentation/val.txt','r') as file:
         
         for line in file:
             val_imgs.append(line.replace('\n',''))
@@ -176,8 +320,8 @@ def createDataset(data_type='train'):
         print('done preparing training data')
         return train_data
     else:
-        val_images = list(map(lambda img_path: imgs_directory + img_path + '.jpg', val_imgs[:10]))
-        val_labels = list(map(lambda img_path: segmentation_directory + img_path + '.png', val_imgs[:10]))
+        val_images = list(map(lambda img_path: imgs_directory + img_path + '.jpg', val_imgs))
+        val_labels = list(map(lambda img_path: segmentation_directory + img_path + '.png', val_imgs))
         val_data = tf.data.Dataset.from_tensor_slices((val_images,val_labels))
 
         print('done preparing validation data')
